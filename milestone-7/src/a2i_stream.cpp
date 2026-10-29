@@ -105,6 +105,7 @@ A2IPlaybackStream::A2IPlaybackStream(const char* log_name, size_t ring_bytes)
       ring_(ring_bytes),
       thread_(),
       thread_valid_(false),
+      worker_done_(false),
       stop_(false),
       running_(false),
       feed_(false),
@@ -135,7 +136,18 @@ bool A2IPlaybackStream::open(const A2IStreamConfig& cfg) {
 }
 
 bool A2IPlaybackStream::start(bool feed) {
-    if (!handle_ || thread_valid_) return false;
+    if (!handle_) return false;
+    // Reap a worker that already exited (e.g. prime/Start failure): its
+    // thread is dead but thread_valid_ is still set, because only stop()
+    // cleared it before. Joining here is safe: the worker set
+    // worker_done_ as its last act and will not touch thread_ again, and
+    // start()/stop() are not concurrent (see the header note).
+    if (thread_valid_) {
+        if (!worker_done_) return false;   // still running: do not start a second worker
+        pthread_join(thread_, NULL);
+        thread_valid_ = false;
+        worker_done_ = false;
+    }
     feed_ = feed;
     stop_ = false;
     ring_.clear();
@@ -143,6 +155,7 @@ bool A2IPlaybackStream::start(bool feed) {
     primed_ = 0;
     underruns_ = 0;
     notify_fail_ = getbuf_fail_ = write_fail_ = 0;
+    worker_done_ = false;
     if (pthread_create(&thread_, NULL, &A2IPlaybackStream::threadStub, this) != 0) {
         printf("[%s] Failed to spawn playback worker\n", name_);
         return false;
@@ -156,6 +169,7 @@ void A2IPlaybackStream::stop() {
         stop_ = true;
         pthread_join(thread_, NULL);
         thread_valid_ = false;
+        worker_done_ = false;
     }
     running_ = false;
     if (handle_) {
@@ -172,7 +186,11 @@ void A2IPlaybackStream::write(const uint8_t* pcm, size_t len) {
 }
 
 void* A2IPlaybackStream::threadStub(void* arg) {
-    reinterpret_cast<A2IPlaybackStream*>(arg)->workerLoop();
+    A2IPlaybackStream* self = reinterpret_cast<A2IPlaybackStream*>(arg);
+    self->workerLoop();
+    // Last act: every exit path (prime/Start failure, normal stop) lands
+    // here, so start() can tell a dead worker from a running one.
+    self->worker_done_ = true;
     return NULL;
 }
 
@@ -272,6 +290,7 @@ A2ICaptureStream::A2ICaptureStream(const char* log_name)
       used_cookie_(0),
       thread_(),
       thread_valid_(false),
+      worker_done_(false),
       stop_(false),
       running_(false),
       started_(false),
@@ -299,12 +318,21 @@ bool A2ICaptureStream::open(const A2IStreamConfig& cfg) {
 }
 
 bool A2ICaptureStream::start(A2ICaptureCallback cb, void* user_data) {
-    if (!handle_ || thread_valid_ || !cb) return false;
+    if (!handle_ || !cb) return false;
+    // Same reap rule as playback: a worker that exited on Start failure
+    // left thread_valid_ set; join it here so a retry can proceed.
+    if (thread_valid_) {
+        if (!worker_done_) return false;
+        pthread_join(thread_, NULL);
+        thread_valid_ = false;
+        worker_done_ = false;
+    }
     cb_ = cb;
     cb_user_ = user_data;
     stop_ = false;
     started_ = false;
     chunks_ = 0;
+    worker_done_ = false;
     if (pthread_create(&thread_, NULL, &A2ICaptureStream::threadStub, this) != 0) {
         printf("[%s] Failed to spawn capture worker\n", name_);
         return false;
@@ -318,6 +346,7 @@ void A2ICaptureStream::stop() {
         stop_ = true;
         pthread_join(thread_, NULL);
         thread_valid_ = false;
+        worker_done_ = false;
     }
     running_ = false;
     if (handle_) {
@@ -334,7 +363,9 @@ void A2ICaptureStream::stop() {
 }
 
 void* A2ICaptureStream::threadStub(void* arg) {
-    reinterpret_cast<A2ICaptureStream*>(arg)->workerLoop();
+    A2ICaptureStream* self = reinterpret_cast<A2ICaptureStream*>(arg);
+    self->workerLoop();
+    self->worker_done_ = true;
     return NULL;
 }
 

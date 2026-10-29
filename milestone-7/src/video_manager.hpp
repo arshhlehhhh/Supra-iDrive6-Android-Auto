@@ -63,8 +63,12 @@ private:
     bool workerRunning();    // takes queue_mutex_
 
     bool createDecoder();     // decoder_mutex_ held
-    void destroyDecoder();    // decoder_mutex_ held
-    void quiesceWorker();
+    // Returns false if the worker was still busy after the quiesce wait, in
+    // which case NOTHING was destroyed or closed (fail-closed, see .cpp).
+    bool destroyDecoder();    // decoder_mutex_ held
+    // Returns false if worker_busy_ is still true after the wait; the caller
+    // must then skip any destroy/close that would race the in-flight send.
+    bool quiesceWorker();
     bool sendMdevSync();
     bool sendMdevFormat(uint32_t width, uint32_t height, uint32_t fps);
     bool sendMdevConfig(const uint8_t* data, size_t length);

@@ -44,14 +44,44 @@ pthread_mutex_t g_symMutex = PTHREAD_MUTEX_INITIALIZER;
 enum { kMaxClients = 6 };   // GAP, MOST server, handsfreed, + NBT_BT_PLAY (DMMAudioSource, SGMedia)
 struct Slot { void* cli; DsiClient* self; };
 Slot g_slots[kMaxClients];
-int g_nslots = 0;               // only grows; entries are written before CDSIConnection::add
+int g_nslots = 0;               // entries are written before CDSIConnection::add; a thread-creation
+                                // failure removes exactly that client's entry again (see unregisterSlot)
 
 DsiClient* lookup(void* cli) {
+    // Read the slot table under the same mutex used for slot writes, so a
+    // concurrent open()/rollback cannot shift the table under this scan.
+    DsiClient* found = NULL;
+    int registered = 0;
+    pthread_mutex_lock(&g_symMutex);
     for (int i = 0; i < g_nslots; ++i)
-        if (g_slots[i].cli == cli) return g_slots[i].self;
+        if (g_slots[i].cli == cli) { found = g_slots[i].self; break; }
+    registered = g_nslots;
+    pthread_mutex_unlock(&g_symMutex);
+    if (found) return found;
     static bool warned = false;
-    if (!warned) { warned = true; printf("[DsiClient] WARNING: callback for unknown client %p (%d registered)\n", cli, g_nslots); }
-    return g_nslots == 1 ? g_slots[0].self : NULL;   // single-client behaviour of earlier builds
+    if (!warned) { warned = true; printf("[DsiClient] WARNING: callback for unknown client %p (%d registered)\n", cli, registered); }
+    // Never fall back to the sole registered client: a callback for an
+    // unknown or stale client must be dropped, not delivered to another
+    // client, where it would be parsed as that client's response.
+    return NULL;
+}
+
+// Remove exactly one client's slot, under the slot mutex. Used only on
+// open() failure after the slot was registered (thread-creation failure).
+// Shifting, rather than just decrementing, is required: another open()
+// may have appended after this client.
+void unregisterSlot(void* cli) {
+    pthread_mutex_lock(&g_symMutex);
+    for (int i = 0; i < g_nslots; ++i) {
+        if (g_slots[i].cli == cli) {
+            for (int j = i + 1; j < g_nslots; ++j) g_slots[j - 1] = g_slots[j];
+            --g_nslots;
+            g_slots[g_nslots].cli = NULL;
+            g_slots[g_nslots].self = NULL;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_symMutex);
 }
 
 void* need(void* lib, const char* name) {
@@ -87,7 +117,13 @@ void DsiClient::putString(std::vector<uint8_t>& v, const char* s) {
 
 bool DsiClient::open(const char* iface, const char* role, int major, int minor) {
     if (cli_) { printf("[DsiClient] open: this client is already open\n"); return false; }
-    if (g_nslots >= kMaxClients) { printf("[DsiClient] open: too many clients (max %d)\n", (int)kMaxClients); return false; }
+    // No unlocked limit check here on purpose. The original code checked
+    // g_nslots >= kMaxClients before dlopen()/construction and wrote the
+    // slot under the mutex much later, so two concurrent open() calls
+    // could both pass at 6 and then overflow g_slots. The only limit check
+    // is the decisive one below, held under g_symMutex through the slot
+    // increment. The cost is that a full table is only discovered after
+    // dlopen/construction, on an error path, not on the hot path.
 
     const char* names[] = {
         "/opt/sys/lib/libsys_dsi_colibry.cpp-ne.so.8",
@@ -126,7 +162,16 @@ bool DsiClient::open(const char* iface, const char* role, int major, int minor) 
 
     conn_ = calloc(1, 0x8c + 64);
     cli_  = static_cast<char*>(calloc(1, 0x14c + 64));
-    if (!conn_ || !cli_) return false;
+    if (!conn_ || !cli_) {
+        // Partial failure: free the surviving allocation instead of
+        // leaking it, and clear both members so a later open() is not
+        // refused by the cli_ != NULL check above. free(NULL) is a no-op.
+        free(conn_);
+        free(cli_);
+        conn_ = NULL;
+        cli_ = NULL;
+        return false;
+    }
 
     printf("[DsiClient] constructing connection + client %s.%s %d.%d\n", role, iface, major, minor);
     g_s.connCtor(conn_);
@@ -136,13 +181,36 @@ bool DsiClient::open(const char* iface, const char* role, int major, int minor) 
     // Copy generously (32 slots): the recipe only lists slots up to +0x1c, but if CDSIClient
     // has more virtuals a short copy would let the library call through heap garbage.
     void** vt = static_cast<void**>(calloc(32, sizeof(void*)));
+    if (!vt) {
+        free(conn_);
+        free(cli_);
+        conn_ = NULL;
+        cli_ = NULL;
+        return false;
+    }
     memcpy(vt, static_cast<char*>(g_s.vtable) + 8, 32 * sizeof(void*));
     vt[3] = reinterpret_cast<void*>(&DsiClient::onAttachedTramp);   // +0x0c attached  (label inferred)
     vt[4] = reinterpret_cast<void*>(&DsiClient::onDetachedTramp);   // +0x10 detached  (label inferred)
     vt[7] = reinterpret_cast<void*>(&DsiClient::onDataTramp);       // +0x1c handleDataResponse
     *reinterpret_cast<void***>(cli_) = vt;
 
+    // Decisive limit check, in the same critical section as the slot
+    // increment: no concurrent open() can pass this check and then
+    // overflow g_slots, because the check and the increment are atomic
+    // with respect to every other writer of g_slots (all of which take
+    // g_symMutex). On failure the not-yet-registered allocations are
+    // freed; nothing was registered, so there is no slot to roll back.
     pthread_mutex_lock(&g_symMutex);
+    if (g_nslots >= kMaxClients) {
+        pthread_mutex_unlock(&g_symMutex);
+        free(vt);
+        free(cli_);
+        free(conn_);
+        cli_ = NULL;
+        conn_ = NULL;
+        printf("[DsiClient] open: too many clients (max %d)\n", (int)kMaxClients);
+        return false;
+    }
     g_slots[g_nslots].cli = cli_;
     g_slots[g_nslots].self = this;
     ++g_nslots;
@@ -157,6 +225,17 @@ bool DsiClient::open(const char* iface, const char* role, int major, int minor) 
     bool started = pthread_create(&t, &at, &DsiClient::threadMain, this) == 0;
     pthread_attr_destroy(&at);
     printf("[DsiClient] connection thread %s\n", started ? "started" : "FAILED");
+    if (!started) {
+        // Roll back exactly this client's slot so it is reusable by a
+        // later open(). The allocations are deliberately NOT freed here:
+        // connAdd() has already run and may have retained the client
+        // pointer, so freeing cli_ would leave a dangling pointer in
+        // the connection; with the slot removed, any later callback for
+        // it is dropped by lookup() instead of being misrouted. This
+        // client itself stays unusable for retry (cli_ != NULL), as
+        // before; only the slot leak is fixed.
+        unregisterSlot(cli_);
+    }
     return started;
 }
 
@@ -229,7 +308,12 @@ bool DsiClient::sendRequest(uint32_t requestId, const std::vector<uint8_t>& payl
     printf("[DsiClient] TX request id=0x%x payload=%u bytes -> send rc=%d\n",
            requestId, (unsigned)payload.size(), rc);
     fflush(stdout);
-    return true;
+    // Return the real result instead of unconditional true. Callers that
+    // check the result (bt_play, voice_scenario) previously logged
+    // success for failed sends; they now log FAILED. See RISKS.md: the
+    // success convention (rc == 0) is assumed, not verified against
+    // libsys_dsi_colibry, and must be confirmed on the first car test.
+    return rc == 0;
 }
 
 } // namespace nbt

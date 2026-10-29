@@ -238,6 +238,7 @@ bool AASession::start(int client_fd) {
     client_fd_ = client_fd;
     pthread_mutex_unlock(&fd_mutex_);
     reassembly_.clear();
+    reassembly_total_.clear();
     sps_pps_cache_.clear();
     pthread_mutex_lock(&touch_mutex_);
     input_ready_ = false;
@@ -682,21 +683,56 @@ bool AASession::sendAudioFocusResponse(uint8_t focus_state) {
 // SensorStartResponse 0x8002 {status=1}, SensorEventIndication 0x8003 with repeated
 // NightMode night_mode=10 {is_night=1} and DrivingStatus driving_status=13 {status=1}.
 // Env: NBT_NIGHT_MODE (0/1, default 0), NBT_DRIVING_STATUS (0=unrestricted, default 0).
+// Bounded varint reader, following the shift-capped getVarint() pattern in
+// sdr_builder.cpp / wireless_setup.cpp. Returns false on a truncated varint,
+// on a varint longer than maxBytes, and (for the 10-byte case) on a byte that
+// would set bits above bit 63. The shift for each byte is therefore always
+// < 64, and never >= 32 into a uint32_t. Callers use 5 bytes for tags and
+// lengths (uint32 range) and 10 bytes for values (a negative int32 is
+// sign-extended to 10 bytes on the wire; the caller truncates to uint32_t).
+static bool pbReadVarint(const std::vector<uint8_t>& d, size_t& i, uint64_t& v, size_t maxBytes) {
+    v = 0;
+    size_t count = 0;
+    while (i < d.size()) {
+        if (count >= maxBytes) return false;
+        uint8_t b = d[i++];
+        if (count == 9 && (b & 0x7F) > 1) return false; // would set bits above 63
+        v |= (uint64_t)(b & 0x7F) << (count * 7);
+        ++count;
+        if (!(b & 0x80)) return true;
+    }
+    return false; // truncated: input ended mid-varint
+}
+
 static uint32_t pbFirstVarint(const std::vector<uint8_t>& d, size_t off, uint32_t field) {
     size_t i = off;
     while (i < d.size()) {
-        uint32_t tag = 0; int sh = 0;
-        while (i < d.size()) { uint8_t b = d[i++]; tag |= (uint32_t)(b & 0x7F) << sh; sh += 7; if (!(b & 0x80)) break; }
+        uint64_t tag64 = 0;
+        if (!pbReadVarint(d, i, tag64, 5)) return 0xFFFFFFFFu;
+        if (tag64 > 0xFFFFFFFFULL) return 0xFFFFFFFFu;
+        uint32_t tag = (uint32_t)tag64;
         uint32_t f = tag >> 3, w = tag & 7;
         if (w == 0) {
-            uint32_t v = 0; sh = 0;
-            while (i < d.size()) { uint8_t b = d[i++]; v |= (uint32_t)(b & 0x7F) << sh; sh += 7; if (!(b & 0x80)) break; }
-            if (f == field) return v;
+            uint64_t v64 = 0;
+            if (!pbReadVarint(d, i, v64, 10)) return 0xFFFFFFFFu;
+            if (f == field) return (uint32_t)v64;
         } else if (w == 2) {
-            uint32_t len = 0; sh = 0;
-            while (i < d.size()) { uint8_t b = d[i++]; len |= (uint32_t)(b & 0x7F) << sh; sh += 7; if (!(b & 0x80)) break; }
-            i += len;
-        } else if (w == 1) { i += 8; } else if (w == 5) { i += 4; } else { break; }
+            uint64_t len64 = 0;
+            if (!pbReadVarint(d, i, len64, 5)) return 0xFFFFFFFFu;
+            if (len64 > 0xFFFFFFFFULL) return 0xFFFFFFFFu;
+            // Bounds check by subtraction, never by i + len: i <= d.size() here,
+            // so this cannot wrap on 32-bit ARM the way i += len could.
+            if (len64 > d.size() - i) return 0xFFFFFFFFu;
+            i += (size_t)len64;
+        } else if (w == 1) {
+            if (d.size() - i < 8) return 0xFFFFFFFFu;
+            i += 8;
+        } else if (w == 5) {
+            if (d.size() - i < 4) return 0xFFFFFFFFu;
+            i += 4;
+        } else {
+            return 0xFFFFFFFFu; // unknown wire type (was: break)
+        }
     }
     return 0xFFFFFFFFu;
 }
@@ -823,6 +859,10 @@ void AASession::sessionLoop() {
             if (flags & 0x08) {
                 if (!cryptor_.decrypt(&payload[0], payload.size(), decrypted_chunk)) {
                     printf("[AASession] Failed to decrypt encrypted frame (%u bytes).\n", length);
+                    // A failed chunk must not be spliced into the next message:
+                    // drop any open fragments on this channel.
+                    reassembly_[channel].clear();
+                    reassembly_total_.erase(channel);
                     continue;
                 }
             } else {
@@ -837,24 +877,53 @@ void AASession::sessionLoop() {
             if (reassembly_[channel].size() + decrypted_chunk.size() > (8u * 1024u * 1024u)) {
                 printf("[AASession] Reassembly overflow on channel %u: dropping fragments.\n", channel);
                 reassembly_[channel].clear();
+                reassembly_total_.erase(channel);
                 continue;
             }
 
+            // Presence in reassembly_total_ means a fragmented message is open
+            // on this channel (it was set by its FIRST fragment, which carries
+            // total_size). MIDDLE/LAST with no open FIRST are orphans and must
+            // not be spliced onto stale fragments from an earlier message.
             if (frame_type == 0x01) { // FIRST
                 reassembly_[channel].clear();
+                reassembly_total_[channel] = total_size;
                 reassembly_[channel].insert(reassembly_[channel].end(),
                                              decrypted_chunk.begin(), decrypted_chunk.end());
                 continue; // Wait for remaining fragments
             } else if (frame_type == 0x00) { // MIDDLE
+                if (reassembly_total_.find(channel) == reassembly_total_.end()) {
+                    printf("[AASession] Dropping orphan MIDDLE fragment on channel %u.\n", channel);
+                    continue;
+                }
                 reassembly_[channel].insert(reassembly_[channel].end(),
                                              decrypted_chunk.begin(), decrypted_chunk.end());
                 continue; // Wait for remaining fragments
             } else if (frame_type == 0x02) { // LAST
+                std::map<uint8_t, uint32_t>::iterator expected_it = reassembly_total_.find(channel);
+                if (expected_it == reassembly_total_.end()) {
+                    printf("[AASession] Dropping orphan LAST fragment on channel %u.\n", channel);
+                    continue;
+                }
+                uint32_t expected_total = expected_it->second;
                 reassembly_[channel].insert(reassembly_[channel].end(),
                                              decrypted_chunk.begin(), decrypted_chunk.end());
                 frame_data = reassembly_[channel];
                 reassembly_[channel].clear();
+                reassembly_total_.erase(expected_it);
+                if (frame_data.size() != expected_total) {
+                    printf("[AASession] Dropping fragmented message on channel %u: "
+                           "reassembled %u bytes, FIRST claimed total_size %u.\n",
+                           channel, (unsigned)frame_data.size(), expected_total);
+                    frame_data.clear();
+                    continue; // Do not dispatch a size-mismatched message.
+                }
             } else { // 0x03 = BULK (Single unfragmented message)
+                // A BULK message is complete on its own: any open fragments on
+                // this channel are stale and must not survive to corrupt the
+                // next fragmented message.
+                reassembly_[channel].clear();
+                reassembly_total_.erase(channel);
                 frame_data = decrypted_chunk;
             }
 
@@ -872,6 +941,44 @@ void AASession::sessionLoop() {
             uint16_t msg_id = frame_data.size() >= 2 ? ((static_cast<uint16_t>(frame_data[0]) << 8) | frame_data[1]) : 0;
             g_crumb_stage = 3;
             g_crumb_msg = msg_id;
+
+            // Ticket 2 plaintext gate. A frame is plaintext when its
+            // completing fragment did not carry the encryption flag (0x08);
+            // in legitimate AA traffic all fragments of one message share
+            // that flag, so the completing fragment is representative.
+            // Encrypted frames (which already passed decrypt()) are never
+            // gated here. Plaintext is allowed only for:
+            //   * before the TLS handshake completes: control channel (0)
+            //     VersionResponse (2), SSL Handshake (3), and Ping (11)
+            //     -- the only messages needed to *reach* the handshake;
+            //   * after the handshake completes: Ping (11) only, which the
+            //     protocol sends unencrypted by design (see PingResponse
+            //     below: "Pings are unencrypted").
+            // Everything else plaintext is dropped, not dispatched, so a
+            // peer that never completes TLS cannot trigger mic-open,
+            // video-focus, media, sensor, or other callbacks, and a
+            // plaintext control/media frame cannot be replayed into an
+            // encrypted session. This does not change SSL_VERIFY_NONE;
+            // peer authentication remains a separate follow-up (RISKS.md).
+            {
+                bool encrypted = (flags & 0x08) != 0;
+                bool handshake_done = cryptor_.isHandshakeComplete();
+                bool allowed = encrypted;
+                if (!allowed && !handshake_done) {
+                    allowed = (channel == 0 && (msg_id == 2 || msg_id == 3 || msg_id == 11));
+                } else if (!allowed && handshake_done) {
+                    allowed = (channel == 0 && msg_id == 11);
+                }
+                if (!allowed) {
+                    static unsigned plaintext_drops = 0;
+                    ++plaintext_drops;
+                    if (plaintext_drops <= 20 || (plaintext_drops % 100) == 0) {
+                        printf("[AASession] Dropping plaintext frame (ch=%u, msg=0x%04X, flags=0x%02X, handshake=%s, drop #%u).\n",
+                               channel, msg_id, flags, handshake_done ? "complete" : "incomplete", plaintext_drops);
+                    }
+                    continue;
+                }
+            }
 
             if (channel == 1 && msg_id == 0x8001) { // SensorStartRequest
                 uint32_t st = pbFirstVarint(frame_data, 2, 1);
