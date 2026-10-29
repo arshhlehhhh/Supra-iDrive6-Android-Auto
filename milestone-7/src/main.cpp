@@ -111,6 +111,7 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -1029,6 +1030,29 @@ static void serviceUsbLog(bool atStart) {
                __DATE__, __TIME__);
 }
 
+// Best-effort pfctl helper for Ticket 2. system() returns a wait status, not
+// an exit code: decoding it with WEXITSTATUS is the only way to tell success
+// from failure. Returns true only if the command exited with status 0.
+// Failure is logged loudly but never aborts startup/shutdown: pfctl is a
+// car-connectivity aid here, and a failed restore must not wedge teardown.
+static bool logPfctlResult(const char* what, int rc) {
+    if (rc == -1) {
+        int saved_errno = errno;
+        printf("[Main] ERROR: '%s' could not be started (system() failed, errno=%d). Packet filter state is unknown.\n", what, saved_errno);
+        return false;
+    }
+    if (!WIFEXITED(rc)) {
+        printf("[Main] ERROR: '%s' did not exit normally (wait status %d). Packet filter state is unknown.\n", what, rc);
+        return false;
+    }
+    if (WEXITSTATUS(rc) != 0) {
+        printf("[Main] ERROR: '%s' exited with status %d. Packet filter state is unknown.\n", what, WEXITSTATUS(rc));
+        return false;
+    }
+    printf("[Main] '%s' succeeded.\n", what);
+    return true;
+}
+
 int main(int argc, char* argv[]) {
     if (argc > 1 && (!strcmp(argv[1], "--license") || !strcmp(argv[1], "--licence"))) {
         nbt::printNbtAadLicense();
@@ -1054,11 +1078,14 @@ int main(int argc, char* argv[]) {
 
     // Drop the packet filter so the phone can reach the stock AA port (5277) on uap0.
     // Set NBT_KEEP_PF=1 to leave the firewall alone.
+    // Ticket 2 deliberately keeps pfctl -d: removing it outright would break
+    // phone connectivity on the car. What changes is that its result is now
+    // decoded (not just printed raw) and it is restored at shutdown below.
+    bool pf_disabled = false;
     if (getenv("NBT_KEEP_PF")) {
         printf("[Main] NBT_KEEP_PF set: leaving packet filter untouched.\n");
     } else {
-        int rc = system("pfctl -d");
-        printf("[Main] 'pfctl -d' (disable packet filter) returned %d\n", rc);
+        pf_disabled = logPfctlResult("pfctl -d", system("pfctl -d"));
     }
 
     signal(SIGINT,  signalHandler);
@@ -1139,6 +1166,9 @@ int main(int argc, char* argv[]) {
 
     if (!tcp_server.start()) {
         printf("[Main] Fatal: Failed to start TCP server on port %u\n", (unsigned)g_aaPort);
+        // This early return bypasses the graceful-shutdown block below, so
+        // restore the filter here too if this process disabled it.
+        if (pf_disabled) logPfctlResult("pfctl -e", system("pfctl -e"));
         return 1;
     }
 
@@ -1409,6 +1439,12 @@ int main(int argc, char* argv[]) {
 
     if (g_ctlFd >= 0) close(g_ctlFd);
     unlink(kUiStateFile);   // plugin falls back to the plain "Android Auto" entry
+    // Restore the packet filter this process disabled at startup. Best
+    // effort only: a failed restore is logged loudly by logPfctlResult()
+    // but must not block exit. If the filter was never disabled (KEEP_PF,
+    // or pfctl -d failed), there is nothing to restore.
+    if (pf_disabled) logPfctlResult("pfctl -e", system("pfctl -e"));
+    else printf("[Main] Not restoring packet filter: it was not disabled by this process.\n");
     printf("[Main] nbt-aad shutdown complete.\n");
     fflush(stdout);
     // Leave without running static destructors: detached threads (DSI sender loops, wireless bring-up) may still

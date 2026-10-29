@@ -53,7 +53,7 @@ TcpServer::~TcpServer() {
 }
 
 void TcpServer::notifySessionEnded() {
-    has_active_client_ = false;
+    has_active_client_.store(false);
 }
 
 int TcpServer::tryConnect(const char* ip, uint16_t port, int timeout_ms) {
@@ -136,7 +136,7 @@ bool TcpServer::start() {
     }
 
     is_running_ = true;
-    has_active_client_ = false;
+    has_active_client_.store(false);
 
     pthread_create(&accept_thread_, NULL, &TcpServer::acceptThreadStub, this);
     pthread_create(&connector_thread_, NULL, &TcpServer::connectorThreadStub, this);
@@ -226,10 +226,24 @@ void TcpServer::acceptLoop() {
         printf("[TcpServer] Incoming Android Auto connection from %s:%u (fd: %d)!\n",
                client_ip, ntohs(client_addr.sin_port), client_fd);
 
-        has_active_client_ = true;
+        // Claim the session slot atomically. A second connection must never
+        // displace a live session: if a session is already active, close the
+        // new fd and keep listening. The callback (onClientConnected) clears
+        // the flag via notifySessionEnded() if starting the session fails,
+        // so a failed start does not wedge the server in "active" state.
+        bool expected = false;
+        if (!has_active_client_.compare_exchange_strong(expected, true)) {
+            printf("[TcpServer] Rejecting connection from %s:%u (fd: %d): a session is already active.\n",
+                   client_ip, ntohs(client_addr.sin_port), client_fd);
+            close(client_fd);
+            continue;
+        }
         if (client_callback_) {
             client_callback_(client_fd, client_user_data_);
         } else {
+            // No consumer: do not leave the flag set, or the connector loop
+            // (which waits on has_active_client_) would stall forever.
+            has_active_client_.store(false);
             close(client_fd);
         }
     }
@@ -252,26 +266,35 @@ void TcpServer::connectorLoop() {
     }
 
     while (is_running_) {
-        if (has_active_client_ || scanner_disabled) {
+        if (has_active_client_.load() || scanner_disabled) {
             sleep(1);
             continue;
         }
 
         // 1. Probe priority targets on port 5277
         char ip_buf[32];
-        for (size_t i = 0; i < num_priorities && is_running_ && !has_active_client_; ++i) {
+        for (size_t i = 0; i < num_priorities && is_running_ && !has_active_client_.load(); ++i) {
             snprintf(ip_buf, sizeof(ip_buf), "172.16.224.%d", priority_last_octets[i]);
             int sock = tryConnect(ip_buf, port_, 80);
             if (sock >= 0) {
                 printf("[TcpServer] >>> FOUND ANDROID AUTO PHONE at %s:%u (fd: %d)! Connected!\n",
                        ip_buf, port_, sock);
-                has_active_client_ = true;
+                // Claim atomically: an accept may have started a session
+                // between the probe and here. On a lost claim, close the
+                // socket instead of displacing the live session.
+                bool expected = false;
+                if (!has_active_client_.compare_exchange_strong(expected, true)) {
+                    printf("[TcpServer] Rejecting connector socket (fd: %d): a session is already active.\n", sock);
+                    close(sock);
+                    break;
+                }
                 if (client_callback_) {
                     client_callback_(sock, client_user_data_);
                 } else {
+                    has_active_client_.store(false);
                     close(sock);
                 }
-                while (is_running_ && has_active_client_) {
+                while (is_running_ && has_active_client_.load()) {
                     sleep(1);
                 }
                 break;
@@ -279,19 +302,25 @@ void TcpServer::connectorLoop() {
         }
 
         // 2. Full sweep across entire 172.16.224.100 - 172.16.224.150 range
-        for (int octet = 100; octet <= 150 && is_running_ && !has_active_client_; ++octet) {
+        for (int octet = 100; octet <= 150 && is_running_ && !has_active_client_.load(); ++octet) {
             snprintf(ip_buf, sizeof(ip_buf), "172.16.224.%d", octet);
             int sock = tryConnect(ip_buf, port_, 60);
             if (sock >= 0) {
                 printf("[TcpServer] >>> FOUND ANDROID AUTO PHONE at %s:%u (fd: %d)! Connected!\n",
                        ip_buf, port_, sock);
-                has_active_client_ = true;
+                bool expected = false;
+                if (!has_active_client_.compare_exchange_strong(expected, true)) {
+                    printf("[TcpServer] Rejecting connector socket (fd: %d): a session is already active.\n", sock);
+                    close(sock);
+                    break;
+                }
                 if (client_callback_) {
                     client_callback_(sock, client_user_data_);
                 } else {
+                    has_active_client_.store(false);
                     close(sock);
                 }
-                while (is_running_ && has_active_client_) {
+                while (is_running_ && has_active_client_.load()) {
                     sleep(1);
                 }
                 break;
@@ -299,7 +328,7 @@ void TcpServer::connectorLoop() {
         }
 
         // Rest before next scanning cycle
-        for (int i = 0; i < 15 && is_running_ && !has_active_client_; ++i) {
+        for (int i = 0; i < 15 && is_running_ && !has_active_client_.load(); ++i) {
             usleep(100000); // 100ms
         }
     }

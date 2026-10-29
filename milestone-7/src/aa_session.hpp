@@ -132,6 +132,11 @@ private:
     uint32_t av_session_[32];    // AV session id per channel from START_INDICATION; echoed in media acks (session thread)
 
     std::map<uint8_t, std::vector<uint8_t> > reassembly_;
+    // Expected total message size from the FIRST fragment, per channel.
+    // Presence in this map means a fragmented message is open on that channel;
+    // absence means MIDDLE/LAST fragments must be dropped as orphans.
+    // (Session thread only, like reassembly_; cleared together with it in start().)
+    std::map<uint8_t, uint32_t> reassembly_total_;
     uint32_t media_frames_;
     std::vector<uint8_t> sps_pps_cache_;
 };

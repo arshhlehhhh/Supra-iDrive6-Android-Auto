@@ -4,6 +4,7 @@
 #define TCP_SERVER_HPP
 
 #include <stdint.h>
+#include <atomic>
 #include <pthread.h>
 #include <signal.h>
 
@@ -21,7 +22,7 @@ public:
 
     void setConnectionCallback(ClientConnectedCallback callback, void* user_data = NULL);
     void notifySessionEnded();
-    void markSessionActive() { has_active_client_ = true; }   // re-assert after AASession::start() returned
+    void markSessionActive() { has_active_client_.store(true); }   // re-assert after AASession::start() returned
 
 private:
     static void* acceptThreadStub(void* arg);
@@ -37,7 +38,7 @@ private:
     pthread_t accept_thread_;
     pthread_t connector_thread_;
     volatile bool is_running_;
-    volatile bool has_active_client_;
+    std::atomic<bool> has_active_client_;
 
     ClientConnectedCallback client_callback_;
     void* client_user_data_;

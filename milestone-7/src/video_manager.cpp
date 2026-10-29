@@ -421,7 +421,7 @@ bool VideoManager::cpHandoff() {
     return !(e && e[0] == '0');
 }
 
-void VideoManager::quiesceWorker() {
+bool VideoManager::quiesceWorker() {
     pthread_mutex_lock(&queue_mutex_);
     accepting_ = false;
     frame_queue_.clear();
@@ -430,14 +430,20 @@ void VideoManager::quiesceWorker() {
         pthread_mutex_lock(&queue_mutex_);
         bool busy = worker_busy_;
         pthread_mutex_unlock(&queue_mutex_);
-        if (!busy) return;
+        if (!busy) return true;
         usleep(10000);
     }
-    printf("[VideoManager] Warning: video worker still busy after 3 s\n");
+    // Hard gate: previously this only logged and the caller destroyed the
+    // decoder / closed mdev_fd_ anyway, so the still-busy worker could then
+    // send on a closed or fd-reused mdev connection. Do NOT let the caller
+    // proceed; accepting_ stays false (fail-closed) until a later successful
+    // createDecoder() re-enables it, or retuneForCarPlay() restores it below.
+    printf("[VideoManager] Warning: video worker still busy after 3 s; refusing to destroy/close\n");
+    return false;
 }
 
-void VideoManager::destroyDecoder() {
-    quiesceWorker();
+bool VideoManager::destroyDecoder() {
+    if (!quiesceWorker()) return false;
     if (mmr_lib_ && mmr_ctxt_) {
         typedef int (*mmr_stop_t)(void*);
         typedef int (*mmr_context_destroy_t)(void*);
@@ -452,6 +458,7 @@ void VideoManager::destroyDecoder() {
         mdev_fd_ = -1;
     }
     mdev_initialized_ = false;
+    return true;
 }
 
 bool VideoManager::createDecoder() {
@@ -683,7 +690,14 @@ bool VideoManager::prepareForSession() {
         ok = createDecoder();
     } else if (cp_mode_) {
         printf("[VideoManager] Android Auto phone connected: rebuilding the decoder context (it carried CarPlay's settings)\n");
-        destroyDecoder();
+        // If the worker is still busy, destroyDecoder() left the old context
+        // untouched: do NOT create a second context over it. cp_mode_ is
+        // still true and mmr_ctxt_ is still set, so the next connection
+        // retries the rebuild; accepting_ stays false until then.
+        if (!destroyDecoder()) {
+            pthread_mutex_unlock(&decoder_mutex_);
+            return false;
+        }
         usleep(50000);
         ok = createDecoder();
     }
@@ -727,7 +741,19 @@ bool VideoManager::retuneForCarPlay() {
     int w = cc.iniW > 0 ? cc.iniW : cc.screenW;
     int h = cc.iniH > 0 ? cc.iniH : cc.screenH;
     // Our mdev connection belongs to the Android Auto stream: CarPlay's sender opens its own.
-    quiesceWorker();
+    // If the worker is still busy, skip the whole retune: the decoder is
+    // still in Android Auto settings (cp_mode_ is still false), so restore
+    // accepting_ instead of leaving a live decoder that rejects every frame
+    // (prepareForSession() only rebuilds when cp_mode_ is true or the
+    // context is null, so it would otherwise return success with
+    // accepting_ false). A later retune attempt can retry.
+    if (!quiesceWorker()) {
+        pthread_mutex_lock(&queue_mutex_);
+        accepting_ = (mdev_fd_ >= 0);
+        pthread_mutex_unlock(&queue_mutex_);
+        pthread_mutex_unlock(&decoder_mutex_);
+        return false;
+    }
     if (mdev_fd_ >= 0) { name_close(mdev_fd_); mdev_fd_ = -1; }
     mdev_initialized_ = false;
 
@@ -1006,6 +1032,21 @@ bool VideoManager::postCodecConfig(const uint8_t* data, size_t length) {
     for (size_t i = 0; i < length && i < 48; ++i) printf(" %02x", data[i]);
     printf("\n");
     dumpVideo(data, length, true);
+    // At most one pending codec config: the newest SPS/PPS supersedes any
+    // older one still queued (cached_codec_config_ above was already
+    // replaced, so frames prepended in-band use the newest anyway).
+    // Previously every config was pushed, so a stalled worker let the
+    // queue grow without bound and forced a handshake per queued config.
+    for (std::vector<VideoQueueItem>::iterator it = frame_queue_.begin();
+         it != frame_queue_.end(); ++it) {
+        if (it->is_config) {
+            printf("[VideoManager] Warning: replacing pending codec config (%u bytes) with newer (%u bytes).\n",
+                   static_cast<unsigned int>(it->data.size()),
+                   static_cast<unsigned int>(length));
+            frame_queue_.erase(it);
+            break;
+        }
+    }
     VideoQueueItem item;
     item.data.assign(data, data + length);
     item.pts = 0;

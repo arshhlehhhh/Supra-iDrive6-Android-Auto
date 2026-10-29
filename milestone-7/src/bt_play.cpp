@@ -50,19 +50,20 @@ void onMediaData(DsiClient*, uint32_t type, uint32_t id, uint32_t, const uint8_t
     onData(true, type, id, pl, len);
 }
 
-struct Job { BtPlay* self; const char* why; };
+struct Job { BtPlay* self; const char* why; uint32_t generation; };
 void* playWorker(void* arg) {
     Job* j = static_cast<Job*>(arg);
     int ms = j->self->delayMs();
     if (ms > 0) usleep((useconds_t)ms * 1000u);
-    j->self->sendNow(true, j->why);
+    // Delay behaviour unchanged; only a stale generation is dropped.
+    j->self->sendNowIfGeneration(true, j->why, j->generation);
     delete j;
     return NULL;
 }
 #endif
 } // namespace
 
-BtPlay::BtPlay() : mode_(0), delay_(1500) {}
+BtPlay::BtPlay() : mode_(0), delay_(1500), generation_(0) {}
 
 void BtPlay::buildU32(std::vector<uint8_t>& out, uint32_t v) {
     out.clear();
@@ -108,10 +109,40 @@ void BtPlay::init() {
 
 void BtPlay::sendNow(bool playing, const char* why) {
 #ifndef NBT_HOST_TEST
+    pthread_mutex_lock(&g_txMutex);
+    sendNowLocked(playing, why);
+    pthread_mutex_unlock(&g_txMutex);
+    fflush(stdout);
+#else
+    (void)playing; (void)why;
+#endif
+}
+
+#ifndef NBT_HOST_TEST
+bool BtPlay::sendNowIfGeneration(bool playing, const char* why, uint32_t generation) {
+    pthread_mutex_lock(&g_txMutex);
+    // Atomic with the send below: stop() bumps generation_ under this
+    // same mutex, so a bump cannot land between this check and the send.
+    // (stop() itself bumps, unlocks, then sends STOP via sendNow(); any
+    // ordering is therefore either PLAY-then-STOP or drop-then-STOP,
+    // never PLAY-after-STOP from a stale worker.)
+    if (generation != generation_) {
+        pthread_mutex_unlock(&g_txMutex);
+        printf("[BtPlay] dropping stale delayed PLAY (%s): superseded by a later stop\n", why);
+        fflush(stdout);
+        return false;
+    }
+    sendNowLocked(playing, why);
+    pthread_mutex_unlock(&g_txMutex);
+    fflush(stdout);
+    return true;
+}
+
+void BtPlay::sendNowLocked(bool playing, const char* why) {
     std::vector<uint8_t> p;
     // Sent off the connection thread like VoiceScenario (car-verified pattern): these clients' connection threads
     // only receive responses, and every send goes through this mutex.
-    pthread_mutex_lock(&g_txMutex);
+    // Caller holds g_txMutex.
     if (g_src.attached()) {
         buildU32(p, playing ? kActPlay : kActStop);
         bool ok = g_src.sendRequest(kReqActivate, p);
@@ -130,12 +161,8 @@ void BtPlay::sendNow(bool playing, const char* why) {
             printf("[BtPlay] SendCommand(START) skipped (%s): BlueMedia.SGMedia not attached\n", why);
         }
     }
-    pthread_mutex_unlock(&g_txMutex);
-    fflush(stdout);
-#else
-    (void)playing; (void)why;
-#endif
 }
+#endif // NBT_HOST_TEST
 
 void BtPlay::play(const char* why) {
     if (!mode_) return;
@@ -143,6 +170,12 @@ void BtPlay::play(const char* why) {
     Job* j = new Job;
     j->self = this;
     j->why = why;
+    // Capture under the send mutex: a stop() that bumps before this
+    // read yields a fresh, valid generation; one that bumps after it
+    // makes this worker stale, which sendNowIfGeneration() then drops.
+    pthread_mutex_lock(&g_txMutex);
+    j->generation = generation_;
+    pthread_mutex_unlock(&g_txMutex);
     pthread_attr_t at;
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
@@ -159,6 +192,15 @@ void BtPlay::play(const char* why) {
 
 void BtPlay::stop(const char* why) {
     if (!mode_) return;
+#ifndef NBT_HOST_TEST
+    // Bump first, under the send mutex, so any delayed worker that has
+    // not yet sent will drop in sendNowIfGeneration() instead of sending
+    // PLAY after this STOP. A worker that already sent PLAY did so
+    // before this bump, so the order remains PLAY-then-STOP.
+    pthread_mutex_lock(&g_txMutex);
+    ++generation_;
+    pthread_mutex_unlock(&g_txMutex);
+#endif
     sendNow(false, why);
 }
 

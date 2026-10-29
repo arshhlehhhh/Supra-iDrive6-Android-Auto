@@ -42,11 +42,27 @@ public:
 
     // internal (worker thread)
     void sendNow(bool playing, const char* why);
+#ifndef NBT_HOST_TEST
+    // Send PLAY only if this generation is still current; a stop() since
+    // the play was queued bumps generation_ and makes this drop instead
+    // of sending PLAY after STOP. Check and send are atomic under the
+    // DSI send mutex (see .cpp), so a stale PLAY cannot slip in between
+    // the check and the send.
+    bool sendNowIfGeneration(bool playing, const char* why, uint32_t generation);
+    // sendNow() body with g_txMutex already held; only called from
+    // sendNow() and sendNowIfGeneration().
+    void sendNowLocked(bool playing, const char* why);
+#endif
     int delayMs() const { return delay_; }
 
 private:
     int mode_;
     int delay_;
+    // Bumped by stop() (only). A delayed play worker captures the value
+    // at play() time; if it differs when the worker fires, the play is
+    // stale and must be dropped. Wraparound after 2^32 stops is not a
+    // realistic hazard: a stale worker lives only for the delay window.
+    volatile uint32_t generation_;
 };
 
 } // namespace nbt

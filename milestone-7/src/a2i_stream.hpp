@@ -81,6 +81,15 @@ private:
     PcmRing ring_;
     pthread_t thread_;
     bool thread_valid_;
+    // Set by the worker thread as its last act (threadStub, after
+    // workerLoop() returns, on every exit path). start() may then join
+    // the dead thread and clear thread_valid_, so a transient prime/Start
+    // failure does not permanently block a restart. The worker must NOT
+    // clear thread_valid_ itself: stop() may be joining the same thread,
+    // and a double join is undefined. start()/stop() are still assumed
+    // not to run concurrently with each other (pre-existing discipline:
+    // neither takes a lock today).
+    volatile bool worker_done_;
     volatile bool stop_;
     volatile bool running_;
     volatile bool feed_;
@@ -121,6 +130,9 @@ private:
     uint32_t used_cookie_;
     pthread_t thread_;
     bool thread_valid_;
+    // See the playback class: set by the worker thread in threadStub()
+    // after workerLoop() returns; start() reaps a dead thread on retry.
+    volatile bool worker_done_;
     volatile bool stop_;
     volatile bool running_;
     bool started_;
